@@ -40,6 +40,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.get("/", (req, res) =>
+  res.json({
+    ok: true,
+    routes: ["/health", "/register", "/partyResult", "/spend", "/coins", "/leaderboard"],
+  })
+);
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // Register/attach profile
@@ -81,12 +88,17 @@ app.post("/partyResult", requireSecret, async (req, res) => {
       const currentBest =
         snap.exists && snap.get(bestPath) ? snap.get(bestPath) : 0;
       const newBest = Math.max(currentBest, score || 0);
+      const diff = newBest - currentBest; // increment for aggregate total
 
       tx.set(
         docRef,
         {
           [`partyScores.${gameId}.lastScore`]: score || 0,
           [`partyScores.${gameId}.bestScore`]: newBest,
+          // keep a running total of all party best scores
+          leaderboard: {
+            totalBest: admin.firestore.FieldValue.increment(diff),
+          },
           coins: admin.firestore.FieldValue.increment(coins || 0),
           lastSource: `party:${gameId}`,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -153,6 +165,53 @@ app.get("/coins", requireSecret, async (req, res) => {
     if (!phoneNorm) return res.status(400).json({ error: "phone required" });
     const snap = await players.doc(phoneNorm).get();
     res.json({ coins: snap.exists ? snap.get("coins") || 0 : 0 });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Leaderboard by gameId bestScore
+app.get("/leaderboard", requireSecret, async (req, res) => {
+  try {
+    const gameId = req.query.gameId;
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 20, 100));
+    const useTotal = req.query.mode === "total" || req.query.aggregate === "true";
+    const bestPath = useTotal
+      ? "leaderboard.totalBest"
+      : gameId
+      ? `partyScores.${gameId}.bestScore`
+      : null;
+
+    if (!bestPath)
+      return res.status(400).json({ error: "gameId required unless mode=total" });
+
+    const snap = await players.orderBy(bestPath, "desc").limit(limit).get();
+
+    const items = [];
+    snap.forEach((doc) => {
+      const data = doc.data() || {};
+      let best = 0;
+      if (useTotal)
+      {
+        if (data.leaderboard && typeof data.leaderboard.totalBest === "number")
+          best = data.leaderboard.totalBest;
+      }
+      else if (
+        data.partyScores &&
+        data.partyScores[gameId] &&
+        typeof data.partyScores[gameId].bestScore === "number"
+      ) {
+        best = data.partyScores[gameId].bestScore;
+      }
+      items.push({
+        name: data.name || "Player",
+        phone: data.phone || null,
+        bestScore: best,
+      });
+    });
+
+    res.json({ gameId: useTotal ? "ALL" : gameId, mode: useTotal ? "total" : "single", count: items.length, items });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
